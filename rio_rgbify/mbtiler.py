@@ -138,7 +138,7 @@ def _tile_worker(tile):
         rasterio.band(src, 1),
         out,
         dst_transform=toaffine,
-        dst_crs="epsg:3857",
+        dst_crs=3857,
         resampling=Resampling.bilinear,
     )
 
