@@ -56,6 +56,12 @@ def _rgb_worker(data, window, ij, g_args):
     help="Bounding tile '[{x}, {y}, {z}]' to limit output tiles (.mbtiles output only)",
 )
 @click.option(
+    "--poly-shape",
+    type=str,
+    default=None,
+    help="custom shape poly to limit generated tiles (.mbtiles output only)",
+)
+@click.option(
     "--min-z",
     type=int,
     default=None,
@@ -82,6 +88,7 @@ def rgbify(
     max_z,
     min_z,
     bounding_tile,
+    poly_shape,
     format,
     workers,
     verbose,
@@ -130,6 +137,7 @@ def rgbify(
             round_digits=round_digits,
             format=format,
             bounding_tile=bounding_tile,
+            poly_shape=poly_shape,
             max_z=max_z,
             min_z=min_z,
         ) as tiler:

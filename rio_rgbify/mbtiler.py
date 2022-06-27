@@ -6,6 +6,7 @@ import sys
 import math
 import traceback
 import itertools
+import pyproj
 
 import mercantile
 import rasterio
@@ -25,11 +26,64 @@ from rasterio.enums import Resampling
 
 from rio_rgbify.encoders import data_to_rgb
 
+from shapely import geometry, wkt, ops
+
 buffer = bytes if sys.version_info > (3,) else buffer
 
 work_func = None
 global_args = None
 src = None
+
+
+def parse_poly(filepath):
+    """Parse an Osmosis polygon filter file.
+
+    Accept a sequence of lines from a polygon file, return a shapely.geometry.MultiPolygon object.
+
+    http://wiki.openstreetmap.org/wiki/Osmosis/Polygon_Filter_File_Format
+    """
+
+    file1 = open(filepath, "r")
+    lines = file1.readlines()
+    in_ring = False
+    coords = []
+
+    for (index, line) in enumerate(lines):
+        if index == 0:
+            # first line is junk.
+            continue
+
+        elif index == 1:
+            # second line is the first polygon ring.
+            coords.append([[], []])
+            ring = coords[-1][0]
+            in_ring = True
+
+        elif in_ring and line.strip() == "END":
+            # we are at the end of a ring, perhaps with more to come.
+            in_ring = False
+
+        elif in_ring:
+            # we are in a ring and picking up new coordinates.
+            ring.append(list(map(float, line.split())))
+
+        elif not in_ring and line.strip() == "END":
+            # we are at the end of the whole polygon.
+            break
+
+        elif not in_ring and line.startswith("!"):
+            # we are at the start of a polygon part hole.
+            coords[-1][1].append([])
+            ring = coords[-1][1][-1]
+            in_ring = True
+
+        elif not in_ring:
+            # we are at the start of a polygon part.
+            coords.append([[], []])
+            ring = coords[-1][0]
+            in_ring = True
+
+    return geometry.MultiPolygon(coords)
 
 
 def _main_worker(inpath, g_work_func, g_args):
@@ -120,7 +174,6 @@ def _tile_worker(tile):
 
     """
     x, y, z = tile
-
     bounds = [
         c
         for i in (
@@ -142,7 +195,12 @@ def _tile_worker(tile):
         resampling=Resampling.bilinear,
     )
 
-    out = data_to_rgb(out, global_args["base_val"], global_args["interval"], global_args["round_digits"])
+    out = data_to_rgb(
+        out,
+        global_args["base_val"],
+        global_args["interval"],
+        global_args["round_digits"],
+    )
 
     return tile, global_args["writer_func"](out, global_args["kwargs"].copy(), toaffine)
 
@@ -170,7 +228,40 @@ def _tile_range(min_tile, max_tile):
     return itertools.product(range(min_x, max_x + 1), range(min_y, max_y + 1))
 
 
-def _make_tiles(bbox, src_crs, minz, maxz):
+def _make_tiles(w, s, e, n, minz, maxz):
+    EPSILON = 1.0e-10
+
+    w += EPSILON
+    s += EPSILON
+    e -= EPSILON
+    n -= EPSILON
+    s = max(s, -89)
+    n = min(n, 89)
+
+    for z in range(minz, maxz + 1):
+        for x, y in _tile_range(mercantile.tile(w, n, z), mercantile.tile(e, s, z)):
+            yield [x, y, z]
+
+
+def _make_tiles_shape(w, s, e, n, minz, maxz, geom):
+    EPSILON = 1.0e-10
+
+    w += EPSILON
+    s += EPSILON
+    e -= EPSILON
+    n -= EPSILON
+
+    for z in range(minz, maxz + 1):
+        simplifiedGeom = geom.simplify(80 / 256 / z, preserve_topology=True)
+        for x, y in _tile_range(mercantile.tile(w, n, z), mercantile.tile(e, s, z)):
+            tw, ts, te, tn = mercantile.bounds(x, y, z)
+            if geometry.Polygon(
+                [[tw, ts], [tw, tn], [te, tn], [te, ts], [tw, ts]]
+            ).intersects(geom):
+                yield [x, y, z]
+
+
+def _make_tiles_and_bounds(bbox, src_crs, minz, maxz):
     """
     Given a bounding box, zoom range, and source crs,
     find all tiles that would intersect
@@ -193,17 +284,37 @@ def _make_tiles(bbox, src_crs, minz, maxz):
         the provided bounding box
     """
     w, s, e, n = transform_bounds(*[src_crs, "EPSG:4326"] + bbox, densify_pts=0)
+    tiles = _make_tiles(w, s, e, n, minz, maxz)
+    return [[w, s, e, n], tiles]
 
-    EPSILON = 1.0e-10
 
-    w += EPSILON
-    s += EPSILON
-    e -= EPSILON
-    n -= EPSILON
+def _make_tiles_and_bounds_shape(poly_shape, src_crs, minz, maxz):
+    """
+    Given a poly shape file, zoom range, and source crs,
+    find all tiles that would intersect
 
-    for z in range(minz, maxz + 1):
-        for x, y in _tile_range(mercantile.tile(w, n, z), mercantile.tile(e, s, z)):
-            yield [x, y, z]
+    Parameters
+    -----------
+    poly_shape: str
+        osmosis poly shape file
+    src_crs: str
+        the source crs of the input bbox
+    minz: int
+        minumum zoom to find tiles for
+    maxz: int
+        maximum zoom to find tiles for
+
+    Returns
+    --------
+    tiles: generator
+        generator of [x, y, z] tiles that intersect
+        the provided bounding box
+    """
+
+    geom = parse_poly(poly_shape)
+    w, s, e, n = geom.bounds
+    tiles = _make_tiles_shape(w, s, e, n, minz, maxz, geom)
+    return [[w, s, e, n], tiles]
 
 
 class RGBTiler:
@@ -243,6 +354,8 @@ class RGBTiler:
         Default=png
     bounding_tile: list
         [x, y, z] of bounding tile; limits tiled output to this extent
+    poly_shape: str
+        osmosis poly file to limit  tiled output to tiles intersecting the shape
 
     Returns
     --------
@@ -260,6 +373,7 @@ class RGBTiler:
         base_val=0,
         round_digits=0,
         bounding_tile=None,
+        poly_shape=None,
         **kwargs
     ):
         self.run_function = _tile_worker
@@ -268,6 +382,7 @@ class RGBTiler:
         self.min_z = min_z
         self.max_z = max_z
         self.bounding_tile = bounding_tile
+        self.poly_shape = poly_shape
 
         if not "format" in kwargs:
             writer_func = _encode_as_png
@@ -315,10 +430,22 @@ class RGBTiler:
         with rasterio.open(self.inpath) as src:
             bbox = list(src.bounds)
             src_crs = src.crs
-
         # remove the output filepath if it exists
         if os.path.exists(self.outpath):
             os.unlink(self.outpath)
+
+        # generator of tiles to make
+        if not self.poly_shape is None:
+            bounds, tiles = _make_tiles_and_bounds_shape(
+                self.poly_shape, src_crs, self.min_z, self.max_z
+            )
+        elif self.bounding_tile is None:
+            bounds, tiles = _make_tiles_and_bounds(bbox, src_crs, self.min_z, self.max_z)
+        else:
+            constrained_bbox = list(mercantile.bounds(self.bounding_tile))
+            bounds, tiles = _make_tiles_and_bounds(
+                constrained_bbox, "EPSG:4326", self.min_z, self.max_z
+            )
 
         # create a connection to the mbtiles file
         conn = sqlite3.connect(self.outpath)
@@ -363,13 +490,6 @@ class RGBTiler:
                 _main_worker,
                 (self.inpath, self.run_function, self.global_args),
             )
-
-        # generator of tiles to make
-        if self.bounding_tile is None:
-            tiles = _make_tiles(bbox, src_crs, self.min_z, self.max_z)
-        else:
-            constrained_bbox = list(mercantile.bounds(self.bounding_tile))
-            tiles = _make_tiles(constrained_bbox, "EPSG:4326", self.min_z, self.max_z)
 
         for tile, contents in self.pool.imap_unordered(self.run_function, tiles):
             x, y, z = tile
