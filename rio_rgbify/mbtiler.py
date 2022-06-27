@@ -467,6 +467,24 @@ class RGBTiler:
             "INSERT INTO metadata " "(name, value) " "VALUES ('format', ?);",
             (self.image_format,),
         )
+        cur.execute(
+            "INSERT INTO metadata " "(name, value) " "VALUES ('minzoom', ?);",
+            (self.min_z,),
+        )
+        cur.execute(
+            "INSERT INTO metadata " "(name, value) " "VALUES ('maxzoom', ?);",
+            (self.max_z,),
+        )
+        if(self.round_digits != 0):
+            cur.execute(
+                "INSERT INTO metadata " "(name, value) " "VALUES ('round-digits', ?);",
+                (self.round_digits,),
+            )
+
+        cur.execute(
+            "INSERT INTO metadata " "(name, value) " "VALUES ('bounds', ?);",
+            (','.join(str(x) for x in bounds),),
+        )
 
         cur.execute("INSERT INTO metadata " "(name, value) " "VALUES ('name', '');")
         cur.execute(
