@@ -383,6 +383,7 @@ class RGBTiler:
         self.max_z = max_z
         self.bounding_tile = bounding_tile
         self.poly_shape = poly_shape
+        self.round_digits = round_digits
 
         if not "format" in kwargs:
             writer_func = _encode_as_png
@@ -421,6 +422,9 @@ class RGBTiler:
         if ext_t:
             traceback.print_exc()
 
+    def zxyToId(self, z , x , y ):
+        return (1 - pow(4, z)) / (1 - 4) + pow(2, z) * y + x
+
     def run(self, processes=4):
         """
         Warp, encode, and tile
@@ -451,11 +455,28 @@ class RGBTiler:
         conn = sqlite3.connect(self.outpath)
         cur = conn.cursor()
 
-        # create the tiles table
+        # create the tiles_data table
         cur.execute(
-            "CREATE TABLE tiles "
+            "CREATE TABLE tiles_data "
+            "(tile_data_id integer primary key, tile_data blob);"
+        )
+        # create the tiles_shallow table
+        cur.execute(
+            "CREATE TABLE tiles_shallow "
             "(zoom_level integer, tile_column integer, "
-            "tile_row integer, tile_data blob);"
+            "tile_row integer, tile_data_id integer , primary key(zoom_level,tile_column,tile_row)) without rowid;"
+        )
+
+        # create the tiles view
+        cur.execute("""
+            CREATE VIEW tiles AS
+            SELECT
+                tiles_shallow.zoom_level as zoom_level,
+                tiles_shallow.tile_column as tile_column,
+                tiles_shallow.tile_row as tile_row,
+                tiles_data.tile_data as tile_data
+            FROM tiles_shallow 
+            JOIN tiles_data on tiles_shallow.tile_data_id = tiles_data.tile_data_id"""
         )
         # create empty metadata
         cur.execute("CREATE TABLE metadata (name text, value text);")
@@ -508,19 +529,28 @@ class RGBTiler:
                 _main_worker,
                 (self.inpath, self.run_function, self.global_args),
             )
-
+        md5_hash = hashlib.md5()
         for tile, contents in self.pool.imap_unordered(self.run_function, tiles):
             x, y, z = tile
 
             # mbtiles use inverse y indexing
             tiley = int(math.pow(2, z)) - y - 1
+            data = buffer(contents)
+            # md5_hash.update(contents)
 
+            tileDataId = self.zxyToId(z, x, y)
             # insert tile object
             cur.execute(
-                "INSERT INTO tiles "
-                "(zoom_level, tile_column, tile_row, tile_data) "
+                "INSERT INTO tiles_shallow "
+                "(zoom_level, tile_column, tile_row, tile_data_id) "
                 "VALUES (?, ?, ?, ?);",
-                (z, x, tiley, buffer(contents)),
+                (z, x, tiley, tileDataId),
+            )
+            cur.execute(
+                "INSERT INTO tiles_data "
+                "(tile_data_id, tile_data) "
+                "VALUES (?, ?);",
+                (tileDataId, data),
             )
 
             conn.commit()
