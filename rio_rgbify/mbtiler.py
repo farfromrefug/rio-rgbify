@@ -529,7 +529,6 @@ class RGBTiler:
                 _main_worker,
                 (self.inpath, self.run_function, self.global_args),
             )
-        md5_hash = hashlib.md5()
         for tile, contents in self.pool.imap_unordered(self.run_function, tiles):
             x, y, z = tile
 
